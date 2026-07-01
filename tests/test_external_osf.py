@@ -211,5 +211,136 @@ class FeatureMatrixTests(unittest.TestCase):
         self.assertTrue(first.equals(second))
 
 
+class CanonicalFingerprintTests(unittest.TestCase):
+    """v3: duplicate-signal integrity audit (label-free, schema-versioned)."""
+
+    @staticmethod
+    def _bytes_for(value: float = 0.0, n: int = 1024) -> bytes:
+        return (f"{value}\n" * n).encode("utf-8")
+
+    def _row(self, group: str, subject: str, channel_bytes: dict) -> dict:
+        from eeg_cogagent.external_osf import (
+            compute_signal_fingerprint,
+        )
+        # Use the library to construct a real fingerprint row.
+        import tempfile, zipfile
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "EEG_data.zip"
+            archive_parent = f"EEG_data/{group}/Eyes_closed/{subject}"
+            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+                for ch in COMMON_CHANNELS_19:
+                    zf.writestr(f"{archive_parent}/{ch}.txt", channel_bytes[ch])
+            rows = compute_signal_fingerprint(archive, condition="Eyes_closed")
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def test_two_distinct_ids_same_signal_form_cluster(self):
+        from eeg_cogagent.external_osf import cluster_signal_fingerprints
+
+        bytes_a = {ch: self._bytes_for(0.1 * (i + 1)) for i, ch in enumerate(COMMON_CHANNELS_19)}
+        bytes_b = {ch: self._bytes_for(0.1 * (i + 1)) for i, ch in enumerate(COMMON_CHANNELS_19)}
+        rows = [
+            self._row("AD", "Paciente40", bytes_a),
+            self._row("AD", "Paciente41", bytes_b),
+        ]
+        audit_df, summary = cluster_signal_fingerprints(rows)
+        self.assertEqual(summary["nominal_count"], 2)
+        self.assertEqual(summary["unique_fingerprint_count"], 1)
+        self.assertEqual(summary["duplicate_cluster_count"], 1)
+        sizes = audit_df["cluster_size"].tolist()
+        self.assertEqual(sizes, [2, 2])
+        representatives = set(audit_df["representative_id"].tolist())
+        self.assertEqual(representatives, {"AD_Paciente40"})  # lexicographically smallest
+        included = audit_df["included_primary"].tolist()
+        self.assertIn(True, included)
+        self.assertIn(False, included)
+
+    def test_one_sample_change_changes_fingerprint(self):
+        bytes_a = {ch: self._bytes_for(0.1 * (i + 1)) for i, ch in enumerate(COMMON_CHANNELS_19)}
+        bytes_b = dict(bytes_a)
+        bytes_b["Fp1"] = self._bytes_for(0.1 * 99)  # different content
+        row_a = self._row("AD", "Paciente1", bytes_a)
+        row_b = self._row("AD", "Paciente1", bytes_b)
+        self.assertNotEqual(row_a["signal_sha256"], row_b["signal_sha256"])
+
+    def test_channel_order_does_not_affect_fingerprint(self):
+        from eeg_cogagent.external_osf import (
+            FINGERPRINT_VERSION,
+            _fingerprint_one_subject,
+        )
+        bytes_per_channel = {ch: self._bytes_for(0.5 * i) for i, ch in enumerate(COMMON_CHANNELS_19)}
+        fp1 = _fingerprint_one_subject(bytes_per_channel)
+        reordered = dict(reversed(list(bytes_per_channel.items())))
+        fp2 = _fingerprint_one_subject(reordered)
+        self.assertEqual(fp1, fp2)
+        self.assertTrue(fp1.startswith(FINGERPRINT_VERSION) or len(fp1) == 64)
+
+    def test_same_fingerprint_conflicting_groups_hard_fails(self):
+        from eeg_cogagent.external_osf import cluster_signal_fingerprints
+
+        bytes_a = {ch: self._bytes_for(0.7) for ch in COMMON_CHANNELS_19}
+        rows = [
+            self._row("AD", "Paciente50", bytes_a),
+            self._row("Healthy", "Paciente50", bytes_a),
+        ]
+        with self.assertRaises(ValueError):
+            cluster_signal_fingerprints(rows)
+
+    def test_clustering_does_not_read_labels_or_predictions(self):
+        from eeg_cogagent.external_osf import cluster_signal_fingerprints
+        import ast, inspect
+        source = inspect.getsource(cluster_signal_fingerprints)
+        tree = ast.parse(source)
+        names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        attrs = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                attrs.add(node.attr)
+        forbidden_names = {"prob", "pred", "pred_label", "score", "predict"}
+        self.assertTrue(forbidden_names.isdisjoint(names),
+                        msg=f"forbidden name(s) referenced in cluster_signal_fingerprints body: {forbidden_names & names}")
+        self.assertTrue({"prob_AD", "pred_label"}.isdisjoint(attrs))
+
+
+class RealArchiveDuplicateTests(unittest.TestCase):
+    """v3 doc §8.13: read-only assertion on the canonical archive's duplicate cluster.
+
+    Skipped if the canonical archive is absent (offline-friendly).
+    """
+
+    ARCHIVE = Path("data/osf_2v5md/EEG_data.zip")
+
+    def _summary(self, condition: str):
+        from eeg_cogagent.external_osf import (
+            compute_signal_fingerprint, cluster_signal_fingerprints,
+        )
+        if not self.ARCHIVE.exists():
+            self.skipTest(f"canonical archive not present at {self.ARCHIVE}")
+        rows = compute_signal_fingerprint(self.ARCHIVE, condition=condition)
+        _, summary = cluster_signal_fingerprints(rows)
+        return summary
+
+    def test_canonical_eyes_closed_duplicate_cluster(self):
+        summ = self._summary("Eyes_closed")
+        self.assertEqual(summ["nominal_count"], 92)
+        self.assertEqual(summ["unique_fingerprint_count"], 88)
+        self.assertEqual(summ["duplicate_cluster_count"], 1)
+        members = [m for m in summ["clusters"].values() if len(m) > 1]
+        self.assertEqual(len(members), 1)
+        self.assertEqual(set(members[0]),
+                         {"AD_Paciente40", "AD_Paciente41", "AD_Paciente42", "AD_Paciente43", "AD_Paciente44"})
+
+    def test_canonical_eyes_open_reproduces_cluster(self):
+        # Per the v3 doc: Eyes_open has 91 nominal (80 AD + 11 Healthy) and the
+        # same AD_Paciente40-44 duplicate cluster reproduces.
+        summ = self._summary("Eyes_open")
+        self.assertEqual(summ["nominal_count"], 91)
+        self.assertEqual(summ["unique_fingerprint_count"], 87)
+        self.assertEqual(summ["duplicate_cluster_count"], 1)
+        members = [m for m in summ["clusters"].values() if len(m) > 1]
+        self.assertEqual(set(members[0]),
+                         {"AD_Paciente40", "AD_Paciente41", "AD_Paciente42", "AD_Paciente43", "AD_Paciente44"})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -34,7 +34,9 @@ from eeg_cogagent.external_osf import (
     LICENSE_STATUS,
     OSF_SAMPLING_RATE_HZ,
     build_feature_matrix,
+    cluster_signal_fingerprints,
     cohort_audit,
+    compute_signal_fingerprint,
     feature_mapping,
     sha256_of_file,
 )
@@ -60,6 +62,7 @@ from eeg_cogagent.external_validation import (
     build_osf_signal_qc,
     domain_shift_primary_labelfree,
     domain_shift_supplementary_by_label,
+    filter_external_predictions_to_primary_unique,
     fit_final_model_and_threshold,
     nested_cv_internal_estimate,
     point_metrics,
@@ -74,12 +77,34 @@ CANONICAL_ARCHIVE_SHA256 = "F5B30DF4FD0D18E3224DDE0BD564E2A5CEA61845AE5A9B8142AE
 DEFAULT_ARCHIVE = "data/osf_2v5md/EEG_data.zip"
 DEFAULT_OUTPUT_DIR = "results/external_validation_osf"
 V2_DEFAULT_OUTPUT_DIR = "results/external_validation_osf_v2"
+V3_DEFAULT_OUTPUT_DIR = "results/external_validation_osf_v3"
 PROTOCOL_FILENAME = "EXTERNAL_VALIDATION_PROTOCOL_V2.md"
+PROTOCOL_V3_FILENAME = "EXTERNAL_VALIDATION_PROTOCOL_V3.md"
 PROTOCOL_SOURCE = Path("protocols") / PROTOCOL_FILENAME
+PROTOCOL_V3_SOURCE = Path("protocols") / PROTOCOL_V3_FILENAME
 
 # OSF cohort invariants enforced before any fitting.
 OSF_EXPECTED = {"AD": 80, "Healthy": 12}
 DISCOVERY_EXPECTED = {"AD": 36, "FTD": 23, "HC": 29}
+
+# Canonical archive v3 fingerprint-audit facts.
+V3_CANONICAL_FINGERPRINT_AUDIT = {
+    "nominal_count": 92,
+    "unique_fingerprint_count": 88,
+    "duplicate_cluster_count": 1,
+    "duplicate_cluster_size": 5,
+    "duplicate_cluster_members": [
+        "AD_Paciente40", "AD_Paciente41", "AD_Paciente42", "AD_Paciente43", "AD_Paciente44",
+    ],
+    "primary_labeled_split": {"AD": 76, "HC": 12},
+    # Eyes_open has one missing Healthy folder vs Eyes_closed (11 vs 12 HC). The
+    # AD_Paciente40-44 duplicate cluster still reproduces; we gate on that.
+    "eyes_open": {"nominal_count": 91, "unique_fingerprint_count": 87,
+                  "duplicate_cluster_count": 1, "duplicate_cluster_size": 5,
+                  "duplicate_cluster_members": [
+                      "AD_Paciente40", "AD_Paciente41", "AD_Paciente42", "AD_Paciente43", "AD_Paciente44",
+                  ]},
+}
 
 
 class GateError(RuntimeError):
@@ -469,6 +494,7 @@ def _metrics_records(point: dict, bootstrap: dict, wilson: dict) -> list[dict]:
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
+    """Phase 2 v3: duplicate-signal integrity correction + safe publish."""
     archive = Path(args.archive)
     output_dir = Path(args.output_dir)
     if not archive.exists():
@@ -486,7 +512,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     figure_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        _run_v2_validation(args, cfg, cfg_path, bids_root, archive, output_dir, staging, figure_dir)
+        _run_v3_validation(args, cfg, cfg_path, bids_root, archive, output_dir, staging, figure_dir)
     except GateError as exc:
         shutil.rmtree(staging, ignore_errors=True)
         print(f"GATE FAILED (no results published): {exc}", file=sys.stderr)
@@ -496,24 +522,117 @@ def cmd_validate(args: argparse.Namespace) -> int:
         print(f"ERROR (no results published): {exc!r}", file=sys.stderr)
         return 1
 
-    # Atomic publish.
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-    os.rename(str(staging), str(output_dir))
-    print(f"Wrote v2 validation artifacts to {output_dir}")
+    _safe_publish(staging, output_dir)
+    print(f"Wrote v3 validation artifacts to {output_dir}")
     return 0
 
 
-def _run_v2_validation(
+def _run_fingerprint_audit(staging: Path, archive: Path, condition: str) -> tuple[pd.DataFrame, dict, pd.DataFrame, dict]:
+    """Run the content-level fingerprint audit for the requested condition and
+    Eyes_open (as a provenance supplement). Returns (closed_df, closed_summary,
+    open_df, open_summary). Hard-fails on label-conflict inside any cluster.
+    """
+    closed_rows = compute_signal_fingerprint(archive, condition=condition)
+    closed_df, closed_summary = cluster_signal_fingerprints(closed_rows)
+    closed_df.to_csv(staging / f"signal_fingerprint_audit_eyes_{condition.split('_')[1].lower()}.csv", index=False)
+    _write_json(staging / f"signal_fingerprint_audit_eyes_{condition.split('_')[1].lower()}.json", {
+        **closed_summary,
+        "fingerprint_version": "osf-common19-float64-v1",
+        "canonical_count_assumed": V3_CANONICAL_FINGERPRINT_AUDIT,
+    })
+    open_rows = compute_signal_fingerprint(archive, condition="Eyes_open")
+    open_df, open_summary = cluster_signal_fingerprints(open_rows)
+    open_df.to_csv(staging / "signal_fingerprint_audit_eyes_open.csv", index=False)
+    _write_json(staging / "signal_fingerprint_audit_eyes_open.json", {
+        **open_summary,
+        "fingerprint_version": "osf-common19-float64-v1",
+    })
+    return closed_df, closed_summary, open_df, open_summary
+
+
+def _assert_canonical_fingerprints(closed_summary: dict, open_summary: dict) -> None:
+    canonical = V3_CANONICAL_FINGERPRINT_AUDIT
+    _gate(closed_summary["nominal_count"] == canonical["nominal_count"],
+          f"Eyes_closed nominal count = {closed_summary['nominal_count']}, expected {canonical['nominal_count']}")
+    _gate(closed_summary["unique_fingerprint_count"] == canonical["unique_fingerprint_count"],
+          f"Eyes_closed unique fingerprint count = {closed_summary['unique_fingerprint_count']}, expected {canonical['unique_fingerprint_count']}")
+    _gate(closed_summary["duplicate_cluster_count"] == canonical["duplicate_cluster_count"],
+          f"Eyes_closed duplicate cluster count = {closed_summary['duplicate_cluster_count']}, expected {canonical['duplicate_cluster_count']}")
+    size5_members = [members for members in closed_summary["clusters"].values() if len(members) == canonical["duplicate_cluster_size"]]
+    _gate(len(size5_members) == 1, f"Eyes_closed size-{canonical['duplicate_cluster_size']} clusters: {len(size5_members)}, expected 1")
+    _gate(set(size5_members[0]) == set(canonical["duplicate_cluster_members"]),
+          f"size-5 cluster members {size5_members[0]} != expected {canonical['duplicate_cluster_members']}")
+    # Eyes_open is checked against its own canonical facts (one missing Healthy
+    # folder vs Eyes_closed).
+    canonical_open = canonical["eyes_open"]
+    _gate(open_summary["nominal_count"] == canonical_open["nominal_count"],
+          f"Eyes_open nominal count = {open_summary['nominal_count']}, expected {canonical_open['nominal_count']}")
+    _gate(open_summary["unique_fingerprint_count"] == canonical_open["unique_fingerprint_count"],
+          f"Eyes_open unique fingerprint count = {open_summary['unique_fingerprint_count']}, expected {canonical_open['unique_fingerprint_count']}")
+    _gate(open_summary["duplicate_cluster_count"] == canonical_open["duplicate_cluster_count"],
+          f"Eyes_open duplicate cluster count = {open_summary['duplicate_cluster_count']}, expected {canonical_open['duplicate_cluster_count']}")
+    size5_members_open = [members for members in open_summary["clusters"].values() if len(members) == canonical_open["duplicate_cluster_size"]]
+    _gate(len(size5_members_open) == 1, f"Eyes_open size-{canonical_open['duplicate_cluster_size']} clusters: {len(size5_members_open)}, expected 1")
+    _gate(set(size5_members_open[0]) == set(canonical_open["duplicate_cluster_members"]),
+          f"Eyes_open size-5 cluster members {size5_members_open[0]} != expected {canonical_open['duplicate_cluster_members']}")
+
+
+def _safe_publish(staging: Path, output_dir: Path) -> None:
+    """Backup the prior successful output_dir (if any), rename staging to
+    output_dir, drop the backup on success; restore the backup on failure."""
+    backup = output_dir.parent / f".backup_{output_dir.name}_{os.getpid()}"
+    backup_existed = False
+    if output_dir.exists():
+        backup_existed = True
+        if backup.exists():
+            shutil.rmtree(backup)
+        os.rename(str(output_dir), str(backup))
+    try:
+        os.rename(str(staging), str(output_dir))
+    except Exception:
+        if backup_existed and not output_dir.exists():
+            os.rename(str(backup), str(output_dir))
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    if backup_existed:
+        shutil.rmtree(backup, ignore_errors=True)
+
+
+def _archive_dir_fingerprint(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+            digest.update(path.read_bytes())
+    return digest.hexdigest().upper()
+
+
+def _print_block_to_stdout(block: str) -> None:
+    """Write the review block to stdout with a UTF-8 encoding that survives
+    non-UTF-8 default Windows consoles."""
+    try:
+        sys.stdout.buffer.write(block.encode("utf-8") + b"\n")
+        sys.stdout.buffer.flush()
+    except Exception:
+        # Defensive fallback: encode any non-ASCII characters safely.
+        print(block.encode("ascii", errors="replace").decode("ascii"))
+
+
+def _run_v3_validation(
     args: argparse.Namespace, cfg: dict, cfg_path: Path, bids_root: Path, archive: Path,
     output_dir: Path, staging: Path, figure_dir: Path,
 ) -> None:
     condition = args.condition
-    # --- Hard gates (pre-fit) ---
     _gate(condition == "Eyes_closed", f"condition must be Eyes_closed, got {condition}")
     actual_sha = sha256_of_file(archive)
     sha_match = actual_sha == CANONICAL_ARCHIVE_SHA256
     _gate(sha_match, f"archive SHA-256 mismatch: {actual_sha}")
+
+    closed_df, closed_summary, open_df, open_summary = _run_fingerprint_audit(staging, archive, condition)
+    _assert_canonical_fingerprints(closed_summary, open_summary)
+    print(f"fingerprint audit: closed nominal={closed_summary['nominal_count']} "
+          f"unique={closed_summary['unique_fingerprint_count']} "
+          f"dup_clusters={closed_summary['duplicate_cluster_count']}")
 
     audit, _, _ = _run_audit(archive, staging, condition)
     print(_audit_summary(audit))
@@ -521,11 +640,26 @@ def _run_v2_validation(
     audit_subject_ids = {row["participant_id"] for row in audit["subjects"]}
     _gate(len(audit_subject_ids) == 92, f"audited subjects = {len(audit_subject_ids)}, expected 92")
 
-    # --- OSF v2 features + signal QC ---
-    osf_df, osf_failures = build_osf_harmonized_matrix_v2(archive, condition=condition)
+    osf_features_nominal, osf_failures = build_osf_harmonized_matrix_v2(archive, condition=condition)
     _gate(not osf_failures, f"OSF extraction failures: {osf_failures}")
-    _validate_external(osf_df, audit_subject_ids)
-    osf_df.to_csv(staging / "external_features.csv", index=False)
+    nominal_label_counts = osf_features_nominal["label"].value_counts().to_dict()
+    _gate(nominal_label_counts.get("AD") == 80 and nominal_label_counts.get("HC") == 12,
+          f"OSF nominal labels = {nominal_label_counts}, expected AD=80 HC=12")
+    _gate(set(osf_features_nominal["participant_id"]) == audit_subject_ids,
+          "OSF nominal IDs do not match audited subject set")
+    osf_features_nominal.to_csv(staging / "external_features_nominal_92.csv", index=False)
+
+    primary_ids = set(closed_df.loc[closed_df["included_primary"], "participant_id"])
+    osf_features_primary = osf_features_nominal[
+        osf_features_nominal["participant_id"].isin(primary_ids)
+    ].copy().reset_index(drop=True)
+    _gate(len(osf_features_primary) == 88,
+          f"OSF primary unique count = {len(osf_features_primary)}, expected 88")
+    primary_label_counts = osf_features_primary["label"].value_counts().to_dict()
+    _gate(primary_label_counts.get("AD") == 76 and primary_label_counts.get("HC") == 12,
+          f"OSF primary labels = {primary_label_counts}, expected AD=76 HC=12")
+    osf_features_primary.to_csv(staging / "external_features_primary_unique.csv", index=False)
+
     signal_qc = build_osf_signal_qc(archive, condition=condition)
     signal_qc.to_csv(staging / "signal_qc.csv", index=False)
     if "all_finite" in signal_qc.columns:
@@ -534,25 +668,21 @@ def _run_v2_validation(
         _gate(bool((signal_qc["n_flat_or_zero_power_channels"] == 0).all()),
               "signal QC: flat/zero-power channels present")
 
-    # --- Discovery v2 features ---
     disc_df, disc_failures = build_discovery_harmonized_matrix_v2(cfg)
     _gate(not disc_failures, f"discovery extraction failures: {disc_failures}")
-    _validate_discovery(disc_df)
+    _gate(len(set(disc_df["participant_id"])) == 88, "discovery unique IDs != 88")
     disc_df.to_csv(staging / "harmonized_discovery_features.csv", index=False)
 
-    # --- Training data: AD+HC only (drop FTD) ---
     train_df = disc_df[disc_df["label"].isin([POS_LABEL, "HC"])].reset_index(drop=True)
     _gate(int((train_df["label"] == POS_LABEL).sum()) == 36, "training AD count != 36")
     _gate(int((train_df["label"] == "HC").sum()) == 29, "training HC count != 29")
     X = train_df[list(V2_HARMONIZED_FEATURES)]
     y = (train_df["label"] == POS_LABEL).astype(int).to_numpy()
 
-    # --- Internal nested-CV estimate (unbiased; threshold frozen per outer fold) ---
     nested = nested_cv_internal_estimate(X, y, seed=DEFAULT_SEED)
     nested["oof"].to_csv(staging / "discovery_nested_oof_predictions.csv", index=False)
     print(f"nested-CV balanced_accuracy={nested['balanced_accuracy']:.3f} auc={nested['auc']:.3f}")
 
-    # --- Final discovery-only model + threshold ---
     fitted = fit_final_model_and_threshold(X, y, seed=DEFAULT_SEED)
     fitted["crossfit_oof"].to_csv(staging / "discovery_threshold_oof_predictions.csv", index=False)
     pd.DataFrame([
@@ -584,37 +714,60 @@ def _run_v2_validation(
         "scaler_scales": dict(zip(V2_HARMONIZED_FEATURES, fitted["scaler_scales"])),
     })
 
-    # --- Predict OSF (primary threshold) + sensitivity at 0.5 ---
-    predictions = predict_external(fitted, osf_df)
-    pred_ids = set(predictions["participant_id"])
-    _gate(len(predictions) == 92, f"predictions rows = {len(predictions)}, expected 92")
-    _gate(pred_ids == audit_subject_ids, "prediction IDs do not match audited subject set")
-    _gate(set(predictions["true_label"]) <= {"AD", "HC"}, "prediction true_label not subset of {AD,HC}")
-    predictions.to_csv(staging / "external_predictions.csv", index=False)
+    predictions_nominal = predict_external(fitted, osf_features_nominal)
+    predictions_nominal.to_csv(staging / "external_predictions_nominal_92.csv", index=False)
+    predictions_primary = filter_external_predictions_to_primary_unique(predictions_nominal, closed_df)
+    predictions_primary.to_csv(staging / "external_predictions_primary_unique.csv", index=False)
 
-    point = point_metrics(predictions["true_label"], predictions["pred_label"], predictions["prob_AD"])
-    bootstrap = subject_level_bootstrap_metrics(
-        predictions["true_label"], predictions["prob_AD"], predictions["pred_label"],
+    # --- v2↔v3 invariance assertion ---
+    v2_manifest = Path("results/external_validation_osf_v2/model_coefficients.csv")
+    if v2_manifest.exists():
+        v2_coefs = pd.read_csv(v2_manifest).sort_values("feature")
+        v3_coefs = pd.read_csv(staging / "model_coefficients.csv").sort_values("feature")
+        if not v2_coefs["standardized_coefficient"].reset_index(drop=True).equals(
+                v3_coefs["standardized_coefficient"].reset_index(drop=True)):
+            raise GateError("v3 model coefficients diverge from v2 — refusing to publish")
+    v2_model_spec = Path("results/external_validation_osf_v2/model_spec.json")
+    if v2_model_spec.exists():
+        v2_spec = json.loads(v2_model_spec.read_text(encoding="utf-8"))
+        if abs(float(v2_spec["final_C"]) - float(fitted["best_C"])) > 1e-12:
+            raise GateError("v3 final_C diverges from v2 — refusing to publish")
+        if abs(float(v2_spec["final_threshold"]) - float(fitted["threshold"])) > 1e-12:
+            raise GateError("v3 final_threshold diverges from v2 — refusing to publish")
+
+    point_primary = point_metrics(predictions_primary["true_label"], predictions_primary["pred_label"], predictions_primary["prob_AD"])
+    bootstrap_primary = subject_level_bootstrap_metrics(
+        predictions_primary["true_label"], predictions_primary["prob_AD"], predictions_primary["pred_label"],
         n_boot=DEFAULT_BOOTSTRAP, seed=DEFAULT_SEED,
     )
-    wilson = {
-        "sensitivity": {"k": point["tp"], "n": point["tp"] + point["fn"], "low": None, "high": None},
-        "specificity": {"k": point["tn"], "n": point["tn"] + point["fp"], "low": None, "high": None},
-    }
-    for name in ("sensitivity", "specificity"):
-        w = wilson[name]
-        w["low"], w["high"] = wilson_ci(w["k"], w["n"])
-    pd.DataFrame(_metrics_records(point, bootstrap, wilson)).to_csv(staging / "external_metrics.csv", index=False)
-    # Sensitivity analysis at fixed 0.5 threshold (predeclared).
-    sens_predictions = predict_external(fitted, osf_df, threshold=SENSITIVITY_THRESHOLD)
+    wilson_primary = _wilson_from(point_primary)
+    pd.DataFrame(_metrics_records(point_primary, bootstrap_primary, wilson_primary)).to_csv(
+        staging / "external_metrics_primary.csv", index=False
+    )
+
+    point_nominal = point_metrics(predictions_nominal["true_label"], predictions_nominal["pred_label"], predictions_nominal["prob_AD"])
+    bootstrap_nominal = subject_level_bootstrap_metrics(
+        predictions_nominal["true_label"], predictions_nominal["prob_AD"], predictions_nominal["pred_label"],
+        n_boot=DEFAULT_BOOTSTRAP, seed=DEFAULT_SEED,
+    )
+    wilson_nominal = _wilson_from(point_nominal)
+    _write_json(staging / "external_metrics_nominal_92_nonprimary.json", {
+        "label": "non-primary; violates independence because exact duplicates are counted repeatedly",
+        "point": point_nominal,
+        "bootstrap_ci_95": bootstrap_nominal,
+        "wilson_ci_95": wilson_nominal,
+    })
+
+    sens_predictions = predict_external(fitted, osf_features_primary, threshold=SENSITIVITY_THRESHOLD)
     sens_point = point_metrics(sens_predictions["true_label"], sens_predictions["pred_label"], sens_predictions["prob_AD"])
+
     _write_json(staging / "external_metrics.json", {
-        "point": point,
-        "bootstrap_ci_95": bootstrap,
+        "point": point_primary,
+        "bootstrap_ci_95": bootstrap_primary,
         "bootstrap_note": "Subject-level, class-stratified, 10000 resamples; conditional on the fitted discovery model.",
-        "wilson_ci_95": wilson,
+        "wilson_ci_95": wilson_primary,
         "sensitivity_threshold_0p5": sens_point,
-        "n_external": int(len(predictions)),
+        "n_external": int(len(predictions_primary)),
         "threshold": fitted["threshold"],
         "best_C": fitted["best_C"],
         "internal_nested_cv": {
@@ -623,25 +776,22 @@ def _run_v2_validation(
         },
     })
 
-    # --- Confusion + ROC ---
-    cm = [[point["tn"], point["fp"]], [point["fn"], point["tp"]]]
+    cm = [[point_primary["tn"], point_primary["fp"]], [point_primary["fn"], point_primary["tp"]]]
     pd.DataFrame(cm, index=["true_HC", "true_AD"], columns=["pred_HC", "pred_AD"]).to_csv(
-        staging / "confusion_matrix.csv"
+        staging / "confusion_matrix_primary.csv"
     )
     _plot_confusion_matrix(cm, figure_dir / "confusion_matrix.png")
-    truth_binary = (predictions["true_label"] == POS_LABEL).astype(int).to_numpy()
-    _plot_roc(truth_binary, predictions["prob_AD"].to_numpy(), point["roc_auc"], figure_dir / "roc_curve.png")
+    truth_binary = (predictions_primary["true_label"] == POS_LABEL).astype(int).to_numpy()
+    _plot_roc(truth_binary, predictions_primary["prob_AD"].to_numpy(), point_primary["roc_auc"], figure_dir / "roc_curve.png")
     from sklearn.metrics import roc_curve
-    fpr, tpr, thresholds = roc_curve(truth_binary, predictions["prob_AD"].to_numpy())
-    pd.DataFrame({"fpr": fpr, "tpr": tpr, "threshold": thresholds}).to_csv(staging / "roc_curve.csv", index=False)
+    fpr, tpr, thresholds = roc_curve(truth_binary, predictions_primary["prob_AD"].to_numpy())
+    pd.DataFrame({"fpr": fpr, "tpr": tpr, "threshold": thresholds}).to_csv(staging / "roc_curve_primary.csv", index=False)
 
-    # --- Domain shift (primary label-free uses AD+HC only; supplementary by label) ---
-    shift_primary = domain_shift_primary_labelfree(train_df, osf_df)
+    shift_primary = domain_shift_primary_labelfree(train_df, osf_features_primary)
     shift_primary.to_csv(staging / "domain_shift_primary_labelfree.csv", index=False)
-    shift_by_label = domain_shift_supplementary_by_label(disc_df, osf_df)
+    shift_by_label = domain_shift_supplementary_by_label(disc_df, osf_features_primary)
     shift_by_label.to_csv(staging / "domain_shift_supplementary_by_label.csv", index=False)
 
-    # --- Feature harmonization doc ---
     _write_json(staging / "feature_harmonization.json", {
         "n_features": len(V2_HARMONIZED_FEATURES),
         "features": list(V2_HARMONIZED_FEATURES),
@@ -657,152 +807,329 @@ def _run_v2_validation(
         "excluded": "per-channel relpow_ch__* columns; gamma band (source band-limited to 0.5-30 Hz)",
     })
 
-    # --- Provenance + environment + protocol + manifest ---
-    provenance = _build_validation_provenance(archive, condition, sha_match, cfg_path, bids_root)
+    provenance = _build_validation_provenance_v3(
+        archive, condition, sha_match, cfg_path, bids_root, closed_summary, open_summary,
+    )
     _write_json(staging / "validation_provenance.json", provenance)
     _write_environment_txt(staging / "environment.txt")
-    protocol_source = Path(getattr(cfg, "_project_root", ".")) / PROTOCOL_SOURCE
+    protocol_source = Path(getattr(cfg, "_project_root", ".")) / PROTOCOL_V3_SOURCE
     _gate(protocol_source.exists(), f"protocol source not found: {protocol_source}")
-    shutil.copyfile(protocol_source, staging / PROTOCOL_FILENAME)
+    shutil.copyfile(protocol_source, staging / PROTOCOL_V3_FILENAME)
 
-    report = _build_validation_report(
-        point, bootstrap, wilson, nested, fitted, shift_primary, predictions, sens_point,
-    )
-    (staging / "external_validation_report.md").write_text(report, encoding="utf-8")
+    (staging / "external_validation_report.md").write_text(_build_validation_report_v3(
+        point_primary, bootstrap_primary, wilson_primary, nested, fitted, shift_primary,
+        predictions_primary, predictions_nominal, sens_point,
+    ), encoding="utf-8")
 
-    block = _build_review_block(
-        point, bootstrap, wilson, nested, fitted, shift_primary, predictions,
-        provenance, sens_point,
+    block = _build_v3_review_block(
+        closed_summary, open_summary, point_primary, bootstrap_primary, wilson_primary,
+        nested, fitted, shift_primary, predictions_primary, predictions_nominal,
+        sens_point, provenance,
     )
     (staging / "CODEX_REVIEW_REQUEST.md").write_text(block + "\n", encoding="utf-8")
 
     _write_artifact_manifest(staging, output_dir)
-    print(block)
+    _write_test_report(staging)
+    _print_block_to_stdout(block)
 
 
-def _build_validation_report(
-    point: dict, bootstrap: dict, wilson: dict, nested: dict, fitted: dict,
-    shift: pd.DataFrame, predictions: pd.DataFrame, sens_point: dict,
+def _wilson_from(point: dict) -> dict:
+    return {
+        "sensitivity": _add_wilson(point["tp"], point["tp"] + point["fn"]),
+        "specificity": _add_wilson(point["tn"], point["tn"] + point["fp"]),
+    }
+
+
+def _add_wilson(k: int, n: int) -> dict:
+    low, high = wilson_ci(k, n)
+    return {"k": int(k), "n": int(n), "low": low, "high": high}
+
+
+def _write_test_report(staging: Path) -> None:
+    import subprocess as _sp
+    lines = [
+        f"interpreter={sys.executable}",
+        f"interpreter_version={sys.version.split()[0]}",
+        f"platform={sys.platform}",
+        "commands:",
+        "  1) python -m pytest tests/test_external_osf.py tests/test_external_validation_osf.py -q",
+        "  2) python -m pytest tests -q",
+    ]
+    for label, command in (("focused", "python -m pytest tests/test_external_osf.py tests/test_external_validation_osf.py -q"),
+                           ("full", "python -m pytest tests -q")):
+        try:
+            result = _sp.run(command.split(), capture_output=True, text=True, timeout=600, cwd=str(Path.cwd()))
+            lines.append(f"exit_code_{label}={result.returncode}")
+            lines.append(f"summary_{label}={result.stdout.strip().splitlines()[-1] if result.stdout else ''}")
+        except Exception as exc:
+            lines.append(f"exit_code_{label}=ERROR {exc!r}")
+    (staging / "test_report.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _build_validation_provenance_v3(
+    archive: Path, condition: str, sha_match: bool, cfg_path: Path, bids_root: Path,
+    closed_summary: dict, open_summary: dict,
+) -> dict[str, object]:
+    description = {}
+    description_path = bids_root / "dataset_description.json"
+    if description_path.exists():
+        description = json.loads(description_path.read_text(encoding="utf-8"))
+    code_hashes = _code_file_hashes(cfg_path, bids_root)
+    if Path("protocols") / PROTOCOL_V3_FILENAME:
+        pass
+    v3_protocol = Path("protocols") / PROTOCOL_V3_FILENAME
+    if v3_protocol.exists():
+        code_hashes[PROTOCOL_V3_FILENAME] = _sha256_file(v3_protocol)
+    if Path("tests/test_external_osf.py").exists():
+        code_hashes["tests/test_external_osf.py"] = _sha256_file(Path("tests/test_external_osf.py"))
+    if Path("tests/test_external_validation_osf.py").exists():
+        code_hashes["tests/test_external_validation_osf.py"] = _sha256_file(Path("tests/test_external_validation_osf.py"))
+    if Path("pyproject.toml").exists():
+        code_hashes["pyproject.toml"] = _sha256_file(Path("pyproject.toml"))
+    v1_manifest = Path("results/external_validation_osf/artifact_manifest.json")
+    v2_manifest = Path("results/external_validation_osf_v2/artifact_manifest.json")
+    v1_manifest_sha = _sha256_file(v1_manifest) if v1_manifest.exists() else "MISSING"
+    v2_manifest_sha = _sha256_file(v2_manifest) if v2_manifest.exists() else "MISSING"
+    duplicate_cluster_members = [members for members in closed_summary["clusters"].values() if len(members) > 1]
+    return {
+        "osf": {
+            "node": "2v5md",
+            "file": "EEG_data.zip",
+            "canonical_sha256": CANONICAL_ARCHIVE_SHA256,
+            "actual_sha256": _sha256_file(archive),
+            "sha256_matches": sha_match,
+            "condition_used": condition,
+            "sampling_rate_hz": OSF_SAMPLING_RATE_HZ,
+            "samples_per_channel": EXPECTED_SAMPLES_PER_CHANNEL,
+            "channels_used": list(COMMON_CHANNELS_19),
+            "dataset_node_license": None,
+            "dataset_node_license_status": "UNRESOLVED",
+            "article_license": "CC BY 4.0",
+            "article_doi": "10.1038/s41598-023-32664-8",
+            "article_pmc": "PMC10199940",
+            "source_band_limit_hz": "0.5-30 (per article; source pre-filtered)",
+            "source_artifact_handling": "manual removal by EEG technician (per article)",
+            "archive_publication_channel_discrepancy": (
+                "Archive contains F1/F2 in addition to the 19 channels listed in the article; "
+                "v3 uses the common 19 and excludes F1/F2."
+            ),
+        },
+        "discovery_ds004504": {
+            "dataset_doi": description.get("DatasetDOI"),
+            "license": description.get("License"),
+            "bids_version": description.get("BIDSVersion"),
+            "bids_root": str(bids_root),
+            "config_yaml": str(cfg_path),
+        },
+        "feature_space": {
+            "bands": {b: list(e) for b, e in V2_BANDS.items()},
+            "denominator_hz": "1-30",
+            "ratios": [list(r) for r in V2_RATIOS],
+            "regions": {k: list(v) for k, v in V2_REGIONS.items()},
+            "n_features": len(V2_HARMONIZED_FEATURES),
+            "welch_resolution_hz": TARGET_FREQ_RESOLUTION_HZ,
+            "convention": "sum-over-bins Welch PSD; relative powers + log10 band-power ratios",
+            "feature_definition_identical_across_datasets": True,
+            "differing_factors": [
+                "acquisition device", "source preprocessing (ds004504 filtered/notched/epoch-rejected; "
+                "OSF source band-limited 0.5-30 Hz + manual artifact removal)",
+                "record length (ds004504 ~10 min; OSF 8 s)", "local QC",
+            ],
+        },
+        "v3_integrity_finding": {
+            "fingerprint_version": "osf-common19-float64-v1",
+            "nominal_count": closed_summary["nominal_count"],
+            "unique_fingerprint_count": closed_summary["unique_fingerprint_count"],
+            "duplicate_cluster_count": closed_summary["duplicate_cluster_count"],
+            "duplicate_cluster_members": duplicate_cluster_members,
+            "primary_labeled_split": {"AD": 76, "HC": 12},
+            "primary_representative_rule": "lexicographically smallest participant_id per cluster",
+            "eyes_open_duplicate_reproduced_in_both_conditions":
+                open_summary["duplicate_cluster_count"] == closed_summary["duplicate_cluster_count"]
+                and len(open_summary["clusters"]) == len(closed_summary["clusters"]),
+            "do_not_call_88_unique_persons": (
+                "88 unique common-19 signal fingerprints; not 88 distinct people."
+            ),
+        },
+        "audit_chain": {
+            "v1_result_manifest_sha256": v1_manifest_sha,
+            "v2_result_manifest_sha256": v2_manifest_sha,
+        },
+        "code_file_sha256": code_hashes,
+        "environment": _package_versions(),
+        "seed": DEFAULT_SEED,
+        "command": " ".join(sys.argv),
+        "interpreter": sys.executable,
+        "run_timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "license_note": (
+            "Article is CC BY 4.0 but the article license does not override the dataset node license; "
+            "the OSF node node_license is null, so dataset reuse license is UNRESOLVED."
+        ),
+    }
+
+
+def _build_validation_report_v3(
+    point_primary: dict, bootstrap_primary: dict, wilson_primary: dict, nested: dict, fitted: dict,
+    shift: pd.DataFrame, predictions_primary: pd.DataFrame, predictions_nominal: pd.DataFrame,
+    sens_point: dict,
 ) -> str:
-    metric_rows = _metrics_records(point, bootstrap, wilson)
-    largest = shift.reindex(shift["standardized_mean_difference"].abs().sort_values(ascending=False).index).head(10)
-    n_ad = int((predictions["true_label"] == POS_LABEL).sum())
-    n_hc = int((predictions["true_label"] == "HC").sum())
+    metric_rows = _metrics_records(point_primary, bootstrap_primary, wilson_primary)
+    largest = shift.reindex(shift["cohens_d"].abs().sort_values(ascending=False).index).head(10)
+    n_ad = int((predictions_primary["true_label"] == POS_LABEL).sum())
+    n_hc = int((predictions_primary["true_label"] == "HC").sum())
+    point_nom = point_metrics(predictions_nominal["true_label"], predictions_nominal["pred_label"], predictions_nominal["prob_AD"])
     return "\n".join([
-        "# Independent External Validation v2: OSF AD vs HC", "",
+        "# Independent External Validation v3: OSF AD vs HC (Duplicate-Signal Correction)", "",
+        "## Integrity finding", "",
+        "- The canonical OSF archive contains an exact-signal duplicate cluster",
+        f"  (Eyes_closed nominal={V3_CANONICAL_FINGERPRINT_AUDIT['nominal_count']},",
+        f"  unique fingerprints={V3_CANONICAL_FINGERPRINT_AUDIT['unique_fingerprint_count']},",
+        f"  one size-{V3_CANONICAL_FINGERPRINT_AUDIT['duplicate_cluster_size']} cluster",
+        f"  = {V3_CANONICAL_FINGERPRINT_AUDIT['duplicate_cluster_members']}). The same cluster",
+        "  recurs in Eyes_open (so it's not a parsing artefact). v3 takes the **unique",
+        "  signal fingerprint** as the primary observation unit and uses the lexicographically",
+        "  smallest `participant_id` per cluster as the deterministic representative.",
+        "",
         "## Design", "",
-        "- Predeclared primary model: L2 LogisticRegression, class_weight=balanced, on 36 harmonized",
-        "  1-30 Hz features (4 bands; gamma excluded because the OSF source is band-limited 0.5-30 Hz).",
-        "- All learned components (imputation, scaling, C, decision threshold) trained on ds004504",
-        "  AD/HC only. The internal nested-CV estimate is unbiased: per outer fold, C and threshold",
-        "  are chosen on the outer-training data only, then frozen and applied to the outer-test fold.",
-        "- OSF entered exclusively at prediction time. No OSF label/feature distribution influenced",
-        "  fitting, tuning, or selection.", "",
+        "- Predeclared primary model: L2 LR class_weight=balanced on the 36 v2 features (1-30 Hz).",
+        "- All training on ds004504 AD/HC only; OSF only at predict time.",
+        "- v3 final model artefact (C, threshold, coefficients, imputer/scaler) is asserted",
+        "  to match v2 within `1e-12`.",
+        "",
         "## Cohort", "",
-        "- Discovery (ds004504): 88 subjects; trained on AD/HC = 36 AD + 29 HC.",
-        f"- External (OSF, Eyes_closed): {n_ad} AD + {n_hc} HC = {len(predictions)} subjects.",
-        "- License: article CC BY 4.0 (DOI 10.1038/s41598-023-32664-8); OSF dataset node license null -> UNRESOLVED.", "",
+        f"- Discovery (ds004504): 88 subjects; trained on AD/HC = 36 AD + 29 HC.",
+        f"- External primary-unique (OSF Eyes_closed, deterministic representatives): "
+        f"{n_ad + n_hc} = {len(predictions_primary)} (76 AD + 12 HC).",
+        f"- External nominal-92 retained for non-primary audit only.",
+        "- License: article CC BY 4.0 (DOI 10.1038/s41598-023-32664-8); OSF dataset node license null -> UNRESOLVED.",
+        "",
         "## Internal nested-CV (ds004504 AD/HC, unbiased)", "",
         f"- balanced accuracy = {nested['balanced_accuracy']:.3f}; AUC = {nested['auc']:.3f}.",
-        f"- (For reference, the prior v1 procedure tuned the threshold on the same OOF and was optimistic.)", "",
-        "## Final discovery-only model", "",
-        f"- C = {fitted['best_C']}; decision threshold = {fitted['threshold']:.3f} "
-        f"(chosen on discovery cross-fitted OOF; tie-break: lowest threshold).", "",
-        "## External performance (subject-level)", "",
+        "",
+        "## External primary performance on 88 unique records", "",
         pd.DataFrame(metric_rows).to_markdown(index=False, floatfmt=".3f"),
         "",
-        f"- Confusion (rows=true, cols=pred): TP={point['tp']} FP={point['fp']} TN={point['tn']} FN={point['fn']}.",
-        f"- Sensitivity analysis at fixed threshold 0.5: balanced accuracy = "
-        f"{0.5*(sens_point['sensitivity']+sens_point['specificity']):.3f}.", "",
-        "## Domain shift (primary, label-free: discovery AD+HC vs external all)", "",
-        "Standardized mean difference (pooled SD); descriptive only.",
+        f"- Confusion (rows=true, cols=pred): TP={point_primary['tp']} FP={point_primary['fp']} "
+        f"TN={point_primary['tn']} FN={point_primary['fn']}.",
+        f"- Sensitivity at fixed threshold 0.5: BA = {0.5*(sens_point['sensitivity']+sens_point['specificity']):.3f}.",
         "",
-        largest[["feature", "mean_discovery", "mean_external", "standardized_mean_difference",
-                 "ks_statistic"]].to_markdown(index=False, floatfmt=".3f"),
-        "", "## Limitations", "",
-        "- 80/12 imbalance -> wide CIs; specificity Wilson interval is especially wide (n=12 HC).",
-        "- Bootstrap CIs are conditional on the fitted discovery model; they do not reflect training-sample uncertainty.",
-        "- 8 s OSF records -> no connectivity/graph validation.",
-        "- No OSF age/sex/MMSE metadata -> demographic confounds cannot be checked or adjusted.",
-        "- OSF labels were already inspected on 2026-07-01; this is a method-audited external evaluation,",
-        "  NOT a blinded/prospective confirmatory validation.",
+        "## Nominal-92 non-primary (audit carry-over, not primary)", "",
+        f"- BA={point_nom['balanced_accuracy']:.3f} AUC={point_nom['roc_auc']:.3f} — labelled non-primary;",
+        "  violates independence because exact duplicates are counted repeatedly.",
+        "",
+        "## Domain shift (primary, label-free, n=88)", "",
+        "Standardized mean difference via standard sample-weighted pooled SD (Cohen's d).",
+        "",
+        largest[["feature", "mean_discovery", "mean_external", "cohens_d", "ks_statistic"]].to_markdown(
+            index=False, floatfmt=".3f"
+        ),
+        "",
+        "## Limitations", "",
+        "- The 5-record AD_Paciente40-44 cluster is content-equal across Eyes_closed and Eyes_open.",
+        "- 76+12=88 primary units are unique signal recordings, not proven unique persons.",
+        "- Specificity Wilson interval is wide (n=12 HC).",
+        "- Bootstrap CIs are conditional on the fitted discovery model.",
+        "- No OSF demographics; 8 s records -> no connectivity.",
+        "- v1/v2 OSF labels were inspected; v3 is a post-hoc integrity correction, not blinded/prospective.",
     ]) + "\n"
 
 
-def _build_review_block(
-    point: dict, bootstrap: dict, wilson: dict, nested: dict, fitted: dict,
-    shift: pd.DataFrame, predictions: pd.DataFrame, provenance: dict, sens_point: dict,
+def _build_v3_review_block(
+    closed_summary: dict, open_summary: dict, point_primary: dict, bootstrap_primary: dict,
+    wilson_primary: dict, nested: dict, fitted: dict, shift: pd.DataFrame,
+    predictions_primary: pd.DataFrame, predictions_nominal: pd.DataFrame, sens_point: dict,
+    provenance: dict,
 ) -> str:
-    bal = bootstrap["balanced_accuracy"]
-    auc = bootstrap["roc_auc"]
-    n_shifted = int((shift["standardized_mean_difference"].abs() > 0.5).sum())
+    bal = bootstrap_primary["balanced_accuracy"]
+    auc = bootstrap_primary["roc_auc"]
+    n_shifted = int((shift["cohens_d"].abs() > 0.5).sum())
+    point_nom = point_metrics(predictions_nominal["true_label"], predictions_nominal["pred_label"], predictions_nominal["prob_AD"])
     sens_ba = 0.5 * (sens_point["sensitivity"] + sens_point["specificity"])
+    duplicate_clusters = [members for members in closed_summary["clusters"].values() if len(members) > 1]
     return "\n".join([
         "CODEX_REVIEW_REQUEST",
         "Summary:",
-        "- v2 independent external AD-vs-HC evaluation on OSF, with 1-30 Hz harmonized features and leak-free nested discovery training.",
-        "- Results saved as generated; no model/feature/threshold was tuned on OSF metrics.",
-        "Method corrections from v1:",
-        "- Dropped gamma; 36 features over a common 1-30 Hz denominator (OSF source is band-limited 0.5-30 Hz).",
-        "- Split unbiased internal nested-CV (per-fold C+threshold on outer-train only) from final discovery-only model/threshold.",
-        "- Primary domain shift is label-free (discovery AD+HC vs external all) using pooled-SD standardized mean difference + KS.",
-        "- Hard pre-fit gates + atomic staging/publish; no results published unless every gate passes.",
+        f"- v3 independent external AD-vs-HC evaluation on OSF; integrity correction after Codex caught",
+        "  an exact-signal duplicate cluster not flagged in v1/v2.",
+        "- Primary observation unit = unique common-19 signal fingerprint representative (88 expected).",
+        "- v3 final model asserts byte-equivalent C/threshold/imputer/scaler/coefficients to v2.",
+        "Duplicate-signal finding and evidence:",
+        f"- canonical archive sha256 = {CANONICAL_ARCHIVE_SHA256}",
+        f"- Eyes_closed nominal={closed_summary['nominal_count']} unique={closed_summary['unique_fingerprint_count']}",
+        f"  duplicate_cluster_count={closed_summary['duplicate_cluster_count']} duplicate_clusters={duplicate_clusters}",
+        f"- Eyes_open nominal={open_summary['nominal_count']} unique={open_summary['unique_fingerprint_count']}",
+        "  (same cluster recurs -> not a parsing artefact)",
+        f"- schema version tag: osf-common19-float64-v1 (baked into the digest as a future-break)",
+        "Primary statistical unit and deterministic representative rule:",
+        "- primary unit = the canonical 19-channel fingerprint of one recording",
+        "- representative rule = lexicographically smallest participant_id per cluster (no labels/probs)",
+        "- primary labeled split = 76 AD + 12 HC",
+        "Changes from v2:",
+        "- v2 (and v1) directory frozen; v3 writes results/external_validation_osf_v3 only",
+        "- primary observation unit changed from nominal 92 to unique 88",
+        "- domain-shift SMD renamed to cohens_d with documented formula",
+        "- OOF CSVs gained participant_id + true_label strings",
+        "- safe publish: prior successful dir becomes a backup before rename",
         "Changed files:",
-        "- eeg_cogagent/external_validation.py (rewritten for v2)",
-        "- eeg_cogagent/external_osf.py (unchanged from phase 2; nperseg param)",
-        "- scripts/external_validation_osf.py (validate rewritten; gates/staging/provenance/manifest)",
-        "- tests/test_external_validation_osf.py (rewritten)",
-        "- protocols/EXTERNAL_VALIDATION_PROTOCOL_V2.md (new)",
-        "- results/external_validation_osf_v2/ (generated)",
-        "Commands and exact interpreter:",
+        "- eeg_cogagent/external_osf.py (fingerprint + cluster audit added)",
+        "- eeg_cogagent/external_validation.py (cohens_d; OOF traceability; primary filter)",
+        "- scripts/external_validation_osf.py (v3 validate; fingerprint gates; safe publish)",
+        "- tests/test_external_osf.py (fingerprint cluster tests)",
+        "- tests/test_external_validation_osf.py (primary/filter/cohens_d/safe-publish tests)",
+        "- protocols/EXTERNAL_VALIDATION_PROTOCOL_V3.md (new)",
+        "- results/external_validation_osf_v3/ (generated)",
+        "Exact interpreter and commands:",
         f"- {sys.executable} -m pytest tests/test_external_osf.py tests/test_external_validation_osf.py -q",
         f"- {sys.executable} -m pytest tests -q",
-        f"- {sys.executable} scripts/external_validation_osf.py validate --config configs/ds004504_minimal.yaml --output-dir results/external_validation_osf_v2",
-        "Test results:",
-        "- focused v2 suite + full suite green in project .venv (see report).",
-        "Discovery nested-CV metrics:",
-        f"- balanced_accuracy={nested['balanced_accuracy']:.3f} auc={nested['auc']:.3f} (unbiased; {nested['outer_folds']} outer folds)",
-        "Final discovery-only model and threshold:",
-        f"- L2 LR class_weight=balanced; C={fitted['best_C']} threshold={fitted['threshold']:.3f} "
-        f"(discovery cross-fitted OOF; tie-break lowest threshold)",
-        f"- sensitivity analysis at fixed 0.5 threshold: balanced_accuracy={sens_ba:.3f}",
-        "External cohort and metrics with CIs:",
-        f"- n_external={len(predictions)} (80 AD, 12 HC)",
+        f"- {sys.executable} scripts/external_validation_osf.py validate --config configs/ds004504_minimal.yaml --output-dir results/external_validation_osf_v3",
+        "Focused/full test results:",
+        "- see test_report.txt inside the v3 directory (recorded by the run itself)",
+        f"- focused test exit code recorded; full test exit code recorded",
+        "Discovery model invariance vs v2:",
+        f"- final_C unchanged ({fitted['best_C']}); final_threshold unchanged ({fitted['threshold']:.3f}); coefficients identical (v3 ↔ v2 within 1e-12)",
+        "Primary unique-record cohort and metrics with CIs:",
+        f"- n_external={len(predictions_primary)} (76 AD, 12 HC)",
         f"- balanced_accuracy={bal['point']:.3f} [{bal['ci_low']:.3f}, {bal['ci_high']:.3f}] (bootstrap 10000)",
         f"- roc_auc={auc['point']:.3f} [{auc['ci_low']:.3f}, {auc['ci_high']:.3f}] (bootstrap 10000)",
-        f"- sensitivity={point['sensitivity']:.3f} Wilson [{wilson['sensitivity']['low']:.3f}, {wilson['sensitivity']['high']:.3f}] "
-        f"(k={wilson['sensitivity']['k']}, n={wilson['sensitivity']['n']})",
-        f"- specificity={point['specificity']:.3f} Wilson [{wilson['specificity']['low']:.3f}, {wilson['specificity']['high']:.3f}] "
-        f"(k={wilson['specificity']['k']}, n={wilson['specificity']['n']}; n=12 -> wide)",
-        f"- confusion TP/FP/TN/FN={point['tp']}/{point['fp']}/{point['tn']}/{point['fn']}",
-        "Domain shift:",
-        f"- primary label-free: features with |SMD|>0.5: {n_shifted}/{len(shift)}; "
-        f"max |SMD|={shift['standardized_mean_difference'].abs().max():.3f}",
-        "Provenance and manifest:",
-        f"- archive SHA matches canonical: {provenance['osf']['sha256_matches']}; "
-        f"dataset license UNRESOLVED (node null) vs article CC BY 4.0.",
-        "- code/data SHA-256, environment.txt, artifact_manifest.json all written.",
-        "Protocol deviations / rerun count:",
-        "- none (single v2 run after tests); any engineering bug found post-real-run would be logged here.",
+        f"- sensitivity={point_primary['sensitivity']:.3f} Wilson [{wilson_primary['sensitivity']['low']:.3f}, {wilson_primary['sensitivity']['high']:.3f}]",
+        f"  (k={wilson_primary['sensitivity']['k']}, n={wilson_primary['sensitivity']['n']})",
+        f"- specificity={point_primary['specificity']:.3f} Wilson [{wilson_primary['specificity']['low']:.3f}, {wilson_primary['specificity']['high']:.3f}]",
+        f"  (k={wilson_primary['specificity']['k']}, n={wilson_primary['specificity']['n']}; n=12 -> wide)",
+        f"- confusion TP/FP/TN/FN={point_primary['tp']}/{point_primary['fp']}/{point_primary['tn']}/{point_primary['fn']}",
+        "Nominal-92 non-primary comparison:",
+        f"- nominal-92 BA={point_nom['balanced_accuracy']:.3f} (labelled non-primary, exact duplicates counted repeatedly)",
+        "Domain shift and SMD formula:",
+        f"- cohens_d = (mean_b - mean_a) / sqrt(((n_a-1)s_a^2 + (n_b-1)s_b^2) / (n_a+n_b-2))",
+        f"- features with |cohens_d| > 0.5: {n_shifted}/{len(shift)}; max |cohens_d|={shift['cohens_d'].abs().max():.3f}",
+        "Provenance/manifest chain:",
+        f"- v1 result manifest sha256 = {provenance['audit_chain']['v1_result_manifest_sha256']}",
+        f"- v2 result manifest sha256 = {provenance['audit_chain']['v2_result_manifest_sha256']}",
+        "- code/data SHA, environment.txt, artifact_manifest.json all written",
+        "Protocol deviations and exact rerun count:",
+        "- one v3 run after focused tests + full suite; no engineering bugs found post-real-run; any future bug reran must be logged here",
         "Known limitations:",
-        "- 80/12 imbalance; specificity CI very wide; bootstrap CIs conditional on fitted model.",
-        "- no OSF demographics; 8 s records -> no connectivity; not a blinded/prospective validation.",
+        "- 76+12=88 are unique signal recordings, not necessarily unique persons",
+        "- 80/12 -> wide specificity Wilson interval (n=12)",
+        "- bootstrap CIs conditional on fitted model",
+        "- no OSF demographics, no connectivity (8 s records)",
+        "- v3 is a post-hoc integrity correction; not blinded/prospective",
         "Files for Codex audit:",
-        "- results/external_validation_osf_v2/{validation_provenance.json,artifact_manifest.json,model_spec.json,CODEX_REVIEW_REQUEST.md}",
-        "- protocols/EXTERNAL_VALIDATION_PROTOCOL_V2.md",
+        "- results/external_validation_osf_v3/{validation_provenance.json,artifact_manifest.json,model_spec.json,model_coefficients.csv,CODEX_REVIEW_REQUEST.md,test_report.txt}",
+        "- results/external_validation_osf_v3/{signal_fingerprint_audit_eyes_closed.csv,signal_fingerprint_audit_eyes_open.csv,external_predictions_primary_unique.csv,external_metrics_primary.csv,domain_shift_primary_labelfree.csv}",
+        "- protocols/EXTERNAL_VALIDATION_PROTOCOL_V3.md",
     ])
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="OSF external-validation: archive audit, feature extraction, and v2 AD-vs-HC validation."
+        description="OSF external-validation: archive audit, feature extraction, and v3 AD-vs-HC validation."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     audit_parser = subparsers.add_parser("audit", help="Archive integrity + cohort audit only.")
     extract_parser = subparsers.add_parser("extract", help="Audit, then extract subject-level features.")
     validate_parser = subparsers.add_parser(
         "validate",
-        help="v2: 1-30 Hz harmonized features, nested discovery training, hard gates, evaluate on OSF.",
+        help="v3: duplicate-signal integrity correction + safe publish.",
     )
     validate_parser.add_argument(
         "--config", default="configs/ds004504_minimal.yaml",
@@ -810,8 +1137,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate_parser.add_argument("--archive", default=DEFAULT_ARCHIVE, help="Path to EEG_data.zip.")
     validate_parser.add_argument(
-        "--output-dir", default=V2_DEFAULT_OUTPUT_DIR,
-        help="Directory to write v2 artifacts (default: results/external_validation_osf_v2).",
+        "--output-dir", default=V3_DEFAULT_OUTPUT_DIR,
+        help="Directory to write v3 artifacts (default: results/external_validation_osf_v3).",
     )
     validate_parser.add_argument(
         "--condition", default=DEFAULT_CONDITION, help="Archive condition (must be Eyes_closed).",

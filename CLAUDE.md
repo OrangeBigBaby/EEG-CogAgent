@@ -61,6 +61,21 @@ python scripts/osf_walk.py                                                     #
 
 A standard complete workflow (from README): smoke-test with `--subjects-limit 6`, then full `run`, then the extension scripts above, then `audit`.
 
+### OSF external-validation data integrity (v3 note)
+
+The canonical OSF `2v5md` archive contains an exact-signal duplicate cluster
+(AD_Paciente40-44). The eyes-closed set has nominal 92 folder records (80 AD + 12 HC)
+but only **88 unique common-19 signal fingerprints**, with one size-5 duplicate
+cluster whose rows are bit-identical on the 19 common channels plus F1/F2. The
+cluster reproduces in eyes-open (91 nominal, 87 unique, one missing Healthy
+folder). The primary statistical observation unit in `eeg-cogagent validate` is
+the unique common-19 signal fingerprint, with the lexicographically smallest
+`participant_id` per cluster as the deterministic representative — so the
+primary v3 cohort is 88 unique recording units (76 AD + 12 HC). The 88 are
+unique signal recordings, not necessarily 88 unique persons. See
+`protocols/EXTERNAL_VALIDATION_PROTOCOL_V3.md` and
+`results/external_validation_osf_v3/CODEX_REVIEW_REQUEST.md` for the v3 fix.
+
 ## Architecture
 
 ### Config-driven pipeline

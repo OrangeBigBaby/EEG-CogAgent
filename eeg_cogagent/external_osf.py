@@ -727,3 +727,109 @@ def feature_mapping() -> dict[str, Any]:
             "Label space: discovery labels {AD, FTD, HC}; OSF groups {AD, Healthy}, mapped to label 'AD' and 'HC' for downstream compatibility. No FTD exists in this archive.",
         ],
     }
+
+
+# --- Canonical signal fingerprint + cluster audit (v3) ----------------------
+#
+# Label-free content hash over the 19 common channels in fixed order; written
+# into the digest as a schema version string. Used to detect exact-signal
+# duplicates that share one canonical archive member across multiple nominal
+# folder IDs. Does NOT read labels, predictions, or probabilities to form a
+# cluster; that is enforced by the doc test and read-only code review.
+
+
+#: Schema-version tag written into the digest; bump on channel-set / dtype / byte-order changes.
+FINGERPRINT_VERSION: str = "osf-common19-float64-v1"
+
+
+def _fingerprint_one_subject(channel_bytes: dict[str, bytes], schema_version: str = FINGERPRINT_VERSION) -> str:
+    """SHA-256 over ``schema_version + ch_name + sample_count + float64-bytes``
+    for each ``COMMON_CHANNELS_19`` channel in strict fixed order."""
+    digest = hashlib.sha256()
+    digest.update(schema_version.encode("utf-8"))
+    for channel in COMMON_CHANNELS_19:
+        data = channel_bytes[channel]
+        digest.update(channel.encode("utf-8"))
+        digest.update(str(len(data)).encode("utf-8"))
+        digest.update(data)
+    return digest.hexdigest().upper()
+
+
+def compute_signal_fingerprint(
+    archive: str | Path, condition: str = DEFAULT_CONDITION,
+    schema_version: str = FINGERPRINT_VERSION,
+) -> list[dict[str, str]]:
+    """Label-free: one row per nominal folder-ID with participant_id, group,
+    condition, signal_sha256 computed in the canonical channel order."""
+    summary = index_archive(archive, condition=condition)
+    fingerprint_rows: list[dict[str, str]] = []
+    with _open_zip(archive) as archive_zip:
+        for row in summary.subjects:
+            key = SubjectKey(group=row["group"], condition=condition, subject=row["subject"])
+            per_channel: dict[str, bytes] = {}
+            for channel in COMMON_CHANNELS_19:
+                per_channel[channel] = archive_zip.read(key.member_for(channel))
+            fingerprint_rows.append({
+                "participant_id": f"{row['group']}_{row['subject']}",
+                "group": row["group"],
+                "condition": row["condition"],
+                "signal_sha256": _fingerprint_one_subject(per_channel, schema_version),
+            })
+    return fingerprint_rows
+
+
+def cluster_signal_fingerprints(
+    rows: list[dict[str, str]],
+    excluded_channels_for_conflict: tuple[str, ...] = ("group",),
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Cluster rows by ``signal_sha256`` (no label/probability fields are read
+    to form a cluster). Hard-fails on label/group conflict inside a cluster.
+
+    Returns ``(audit_df, cluster_summary)``. ``representative_id`` is the
+    lexicographically smallest ``participant_id`` in the cluster; ties (which
+    do not arise in this archive because folder IDs are unique) would still be
+    deterministic.
+    """
+    fingerprint_rows = list(rows)  # do not mutate caller's list
+    digest_to_members: dict[str, list[dict[str, str]]] = {}
+    for row in fingerprint_rows:
+        digest_to_members.setdefault(row["signal_sha256"], []).append(row)
+    per_digest_representative: dict[str, str] = {
+        digest: min(member["participant_id"] for member in members)
+        for digest, members in digest_to_members.items()
+    }
+    audit_rows: list[dict[str, Any]] = []
+    for row in fingerprint_rows:
+        fingerprint = row["signal_sha256"]
+        members = digest_to_members[fingerprint]
+        for field in excluded_channels_for_conflict:
+            distinct = {member[field] for member in members}
+            if len(distinct) > 1:
+                raise ValueError(
+                    f"label conflict in cluster {fingerprint}: {field} values {distinct} on members "
+                    f"{sorted(member['participant_id'] for member in members)}"
+                )
+        audit_rows.append({
+            "participant_id": row["participant_id"],
+            "group": row["group"],
+            "condition": row["condition"],
+            "signal_sha256": fingerprint,
+            "cluster_id": fingerprint,
+            "cluster_size": len(members),
+            "representative_id": per_digest_representative[fingerprint],
+            "included_primary": row["participant_id"] == per_digest_representative[fingerprint],
+            "exclusion_reason": "" if row["participant_id"] == per_digest_representative[fingerprint]
+                               else f"exact_signal_duplicate_of:{per_digest_representative[fingerprint]}",
+        })
+    audit_df = pd.DataFrame(audit_rows)
+    cluster_sizes = [len(members) for members in digest_to_members.values()]
+    summary = {
+        "nominal_count": int(audit_df["participant_id"].nunique()),
+        "unique_fingerprint_count": int(audit_df["signal_sha256"].nunique()),
+        "duplicate_cluster_count": int(sum(1 for size in cluster_sizes if size > 1)),
+        "clusters": {
+            digest: sorted(member["participant_id"] for member in members)
+            for digest, members in digest_to_members.items()
+        },
+    }
+    return audit_df, summary

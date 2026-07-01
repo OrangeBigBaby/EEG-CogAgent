@@ -348,23 +348,27 @@ def nested_cv_internal_estimate(
         prob = model.predict_proba(X.iloc[test_idx])[:, 1]
         pred = (prob >= fold_threshold).astype(int)
         for position, idx in enumerate(test_idx):
+            label_str = "AD" if int(y[idx]) == 1 else "HC"
             oof_rows.append({
+                "participant_id": str(X.index[idx]),
+                "true_label": label_str,
+                "true_binary": int(y[idx]),
                 "fold": fold,
                 "row_index": int(idx),
-                "true_label": int(y[idx]),
                 "prob_AD": float(prob[position]),
                 "pred_label": int(pred[position]),
                 "fold_C": float(fold_C),
                 "fold_threshold": float(fold_threshold),
             })
     oof = pd.DataFrame(oof_rows)
-    truth = oof["true_label"].to_numpy()
+    truth = oof["true_binary"].to_numpy()
     pred = oof["pred_label"].to_numpy()
     prob = oof["prob_AD"].to_numpy()
     try:
         auc = float(roc_auc_score(truth, prob))
     except ValueError:
         auc = float("nan")
+    _assert_oof_inventory(oof, X, "nested_oof")
     return {
         "oof": oof,
         "outer_folds": outer_splits,
@@ -372,6 +376,40 @@ def nested_cv_internal_estimate(
         "auc": auc,
         "n_train_total": int(len(y)),
     }
+
+
+def _assert_oof_inventory(oof_df: pd.DataFrame, X: pd.DataFrame, name: str) -> None:
+    """Every discovery AD/HC subject appears exactly once with a string label."""
+    if oof_df.empty:
+        raise RuntimeError(f"{name} OOF is empty")
+    seen = set(str(v) for v in oof_df["participant_id"])
+    expected = {str(idx) for idx in X.index}
+    if seen != expected:
+        missing = expected - seen
+        extra = seen - expected
+        raise RuntimeError(
+            f"{name} OOF participant_id inventory mismatch: "
+            f"missing={len(missing)} extra={len(extra)}"
+        )
+    labels = set(oof_df["true_label"].tolist())
+    if not labels <= {"AD", "HC"}:
+        raise RuntimeError(f"{name} OOF true_label not subset of AD/HC: {labels}")
+
+
+def filter_external_predictions_to_primary_unique(
+    predictions: pd.DataFrame, audit_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Keep only the deterministic fingerprint representative rows (88 expected)."""
+    audit_df = audit_df.copy()
+    primary_ids = set(
+        audit_df.loc[audit_df["included_primary"], "participant_id"].tolist()
+    )
+    kept = predictions[predictions["participant_id"].isin(primary_ids)].copy()
+    if len(kept) != len(primary_ids):
+        raise RuntimeError(
+            f"primary unique predictions mismatch: kept {len(kept)}, expected {len(primary_ids)}"
+        )
+    return kept.reset_index(drop=True)
 
 
 def fit_final_model_and_threshold(
@@ -388,12 +426,15 @@ def fit_final_model_and_threshold(
     scaler = pipeline.named_steps["scale"]
     crossfit_oof = pd.DataFrame({
         "row_index": np.arange(len(y)),
-        "true_label": y.astype(int),
+        "participant_id": [str(idx) for idx in X.index],
+        "true_label": np.where(y.astype(int) == 1, "AD", "HC"),
+        "true_binary": y.astype(int),
         "prob_AD": crossfit_prob,
         "pred_label": (crossfit_prob >= threshold).astype(int),
         "fold_C": float(best_C),
         "fold_threshold": float(threshold),
     })
+    _assert_oof_inventory(crossfit_oof, X, "threshold_oof")
     return {
         "pipeline": pipeline,
         "classes": [int(c) for c in lr.classes_],
@@ -543,18 +584,21 @@ def _iqr(values: np.ndarray) -> float:
     return float(q3 - q1)
 
 
-def _standardized_mean_difference(a: np.ndarray, b: np.ndarray) -> float:
-    """Pooled-SD standardized mean difference (external b minus discovery a).
-
-    Uses Cohen's d pooled SD: sqrt((sd_a^2 + sd_b^2) / 2). Returns NaN if either
-    side is empty or both SDs are zero/non-finite.
-    """
+def _cohens_d(a: np.ndarray, b: np.ndarray) -> float:
+    """Standard sample-weighted pooled-SD Cohen's d:
+    ``(mean_b - mean_a) / sqrt(((n_a-1)sd_a^2 + (n_b-1)sd_b^2) / (n_a+n_b-2))``.
+    Returns NaN if either side is empty, both SDs are non-finite, or n_a+n_b<3.
+    The column is named ``cohens_d`` to match this formula (no "RMS SD" or
+    "Cohen's-like" wording in deliverables)."""
     if a.size == 0 or b.size == 0:
         return float("nan")
-    sd_a, sd_b = _sd(a), _sd(b)
-    if not (np.isfinite(sd_a) and np.isfinite(sd_b)):
+    n_a, n_b = int(a.size), int(b.size)
+    if n_a + n_b < 3:
         return float("nan")
-    pooled = np.sqrt((sd_a ** 2 + sd_b ** 2) / 2.0)
+    var_a, var_b = float(np.var(a, ddof=1)), float(np.var(b, ddof=1))
+    if not (np.isfinite(var_a) and np.isfinite(var_b)):
+        return float("nan")
+    pooled = float(np.sqrt(((n_a - 1) * var_a + (n_b - 1) * var_b) / (n_a + n_b - 2)))
     if pooled == 0 or not np.isfinite(pooled):
         return float("nan")
     return float((_mean(b) - _mean(a)) / pooled)
@@ -577,7 +621,8 @@ def _shift_row(feature: str, a: np.ndarray, b: np.ndarray) -> dict[str, Any]:
         "median_external": _median(b),
         "iqr_discovery": _iqr(a),
         "iqr_external": _iqr(b),
-        "standardized_mean_difference": _standardized_mean_difference(a, b),
+        "cohens_d": _cohens_d(a, b),
+        "cohens_d_formula": "(mean_b - mean_a) / sqrt(((n_a-1)s_a^2 + (n_b-1)s_b^2) / (n_a+n_b-2))",
         "ks_statistic": ks,
     }
 

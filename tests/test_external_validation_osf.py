@@ -278,5 +278,205 @@ class DeterminismTests(unittest.TestCase):
         pd.testing.assert_frame_equal(nested_a["oof"], nested_b["oof"])
 
 
+# ---------------------------------------------------------------------------
+# v3 tests (duplicate-signal integrity correction, SMD rename, OOF traceability,
+# primary filter, CLI gates, safe publish, real-archive duplicate read-only check
+# for eyes_open cross-condition reproducibility).
+# ---------------------------------------------------------------------------
+
+from eeg_cogagent.external_osf import (
+    FINGERPRINT_VERSION,
+    cluster_signal_fingerprints,
+    compute_signal_fingerprint,
+)
+from eeg_cogagent.external_validation import (
+    _cohens_d,
+    _assert_oof_inventory,
+    fit_final_model_and_threshold,
+    filter_external_predictions_to_primary_unique,
+    predict_external,
+)
+
+
+def _audit_frame(seed: int = 0) -> pd.DataFrame:
+    """A 92-row audit-style frame: nominal AD0..79 + Healthy0..11, with one
+    size-5 cluster of AD40..44. The deterministic representative is AD_Paciente40.
+    """
+    rng = np.random.default_rng(seed)
+    rows = []
+    for i in range(1, 81):
+        rows.append({
+            "participant_id": f"AD_Paciente{i}", "group": "AD", "condition": "Eyes_closed",
+            "signal_sha256": f"ad-{i:03d}",
+        })
+    for i in range(1, 13):
+        rows.append({
+            "participant_id": f"Healthy_Paciente{i}", "group": "Healthy", "condition": "Eyes_closed",
+            "signal_sha256": f"hc-{i:03d}",
+        })
+    rows[39] = {"participant_id": "AD_Paciente40", "group": "AD", "condition": "Eyes_closed", "signal_sha256": "shared"}
+    rows[40] = {"participant_id": "AD_Paciente41", "group": "AD", "condition": "Eyes_closed", "signal_sha256": "shared"}
+    rows[41] = {"participant_id": "AD_Paciente42", "group": "AD", "condition": "Eyes_closed", "signal_sha256": "shared"}
+    rows[42] = {"participant_id": "AD_Paciente43", "group": "AD", "condition": "Eyes_closed", "signal_sha256": "shared"}
+    rows[43] = {"participant_id": "AD_Paciente44", "group": "AD", "condition": "Eyes_closed", "signal_sha256": "shared"}
+    return pd.DataFrame(rows)
+
+
+class V3CohensDTests(unittest.TestCase):
+    def test_known_value_reference_dataset(self):
+        # Two equal-sized samples with a known mean shift and pooled SD.
+        a = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        b = np.array([2.0, 3.0, 4.0, 5.0, 6.0])
+        d = _cohens_d(a, b)
+        # mean_b - mean_a = 1; pooled SD with n_a=n_b=5 is sqrt((var_a+var_b)/2) = sqrt(2.5)
+        self.assertAlmostEqual(d, 1.0 / np.sqrt(2.5), places=6)
+        # Directional: reversing sides flips the sign.
+        self.assertAlmostEqual(_cohens_d(a, b), -_cohens_d(b, a), places=12)
+        # Degenerate inputs (n<3) yield NaN.
+        self.assertTrue(np.isnan(_cohens_d(np.array([1.0]), np.array([1.0]))))
+
+
+class V3OOFInventoryTests(unittest.TestCase):
+    def _fit_with_participant_ids(self):
+        rng = np.random.default_rng(11)
+        rows = []
+        for i in range(1, 66):
+            label = "AD" if i < 36 else "HC"
+            row = {"participant_id": f"p{i:03d}", "group": label, "label": label}
+            for j, feat in enumerate(ev.V2_HARMONIZED_FEATURES):
+                row[feat] = float(rng.normal(loc=(1.0 if label == "AD" else -1.0) if j == 0 else 0.0))
+            rows.append(row)
+        df = pd.DataFrame(rows).set_index("participant_id")
+        X = df[list(ev.V2_HARMONIZED_FEATURES)]
+        y = (df["label"] == "AD").astype(int).to_numpy()
+        return X, y
+
+    def test_nested_and_threshold_oofs_carry_participant_id_and_cover_65_unique(self):
+        X, y = self._fit_with_participant_ids()
+        nested = ev.nested_cv_internal_estimate(X, y, seed=42)
+        self.assertIn("participant_id", nested["oof"].columns)
+        self.assertIn("true_label", nested["oof"].columns)
+        self.assertEqual(nested["oof"]["participant_id"].nunique(), 65)
+        self.assertEqual(set(nested["oof"]["true_label"]), {"AD", "HC"})
+        fitted = ev.fit_final_model_and_threshold(X, y, seed=42)
+        self.assertIn("participant_id", fitted["crossfit_oof"].columns)
+        self.assertEqual(fitted["crossfit_oof"]["participant_id"].nunique(), 65)
+        # Direct inventory assertion must pass on both OOF frames.
+        _assert_oof_inventory(nested["oof"], X, "nested_oof")
+        _assert_oof_inventory(fitted["crossfit_oof"], X, "threshold_oof")
+
+
+class V3PrimaryFilterTests(unittest.TestCase):
+    def test_primary_filter_keeps_one_row_per_fingerprint(self):
+        audit = _audit_frame()
+        audit_df, _ = cluster_signal_fingerprints(audit.to_dict("records"))
+        # Simulate an OSF predictions frame for the nominal 92.
+        predictions = pd.DataFrame({
+            "participant_id": audit["participant_id"].tolist(),
+            "true_label": ["AD"] * 80 + ["HC"] * 12,
+            "prob_AD": np.linspace(0.1, 0.9, 92),
+            "pred_label": ["AD"] * 50 + ["HC"] * 42,
+            "threshold": 0.5,
+        })
+        primary = filter_external_predictions_to_primary_unique(predictions, audit_df)
+        self.assertEqual(len(primary), 88)
+        # AD_Paciente40..44 share signal, only AD_Paciente40 should survive.
+        survivors = set(primary["participant_id"])
+        self.assertIn("AD_Paciente40", survivors)
+        for pid in ("AD_Paciente41", "AD_Paciente42", "AD_Paciente43", "AD_Paciente44"):
+            self.assertNotIn(pid, survivors)
+        # All Healthy survivors are present.
+        self.assertEqual(len([p for p in survivors if p.startswith("Healthy_Paciente")]), 12)
+
+    def test_domain_shift_external_n_equals_unique_count(self):
+        rng = np.random.default_rng(0)
+
+        def matrix(n_ad, n_hc, n_ftd=0):
+            rows, pid = [], 0
+            for lab, n in (("AD", n_ad), ("HC", n_hc), ("FTD", n_ftd)):
+                for _ in range(n):
+                    pid += 1
+                    row = {"participant_id": f"p{pid:03d}", "group": lab, "label": lab}
+                    for i, f in enumerate(ev.V2_HARMONIZED_FEATURES):
+                        row[f] = float(rng.normal())
+                    rows.append(row)
+            return pd.DataFrame(rows)
+
+        train_adhc = matrix(20, 15)
+        ext_nominal = matrix(80, 12)
+        ext_primary_unique = ext_nominal.drop_duplicates(subset=["participant_id"]).iloc[:88]
+        shift_nominal = ev.domain_shift_primary_labelfree(train_adhc, ext_nominal)
+        shift_primary = ev.domain_shift_primary_labelfree(train_adhc, ext_primary_unique)
+        self.assertEqual(set(shift_nominal["n_external"]), {92})
+        self.assertEqual(set(shift_primary["n_external"]), {88})
+        # Column renamed to cohens_d, formula recorded.
+        self.assertIn("cohens_d", shift_nominal.columns)
+        self.assertIn("cohens_d_formula", shift_nominal.columns)
+
+
+class V3SafePublishTests(unittest.TestCase):
+    def test_safe_publish_restores_backup_when_rename_fails(self):
+        script = _load_script_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target = tmp_path / "out"
+            backup_marker = tmp_path / "out_prev_marker"
+            backup_marker.mkdir()
+            target.mkdir()
+            (target / "marker.txt").write_text("previous-success", encoding="utf-8")
+            staging = tmp_path / "staging"
+            staging.mkdir()
+            (staging / "new.txt").write_text("new", encoding="utf-8")
+            real_rename = script.os.rename
+
+            def fail_once(*args, **kwargs):
+                if args and "staging" in str(args[0]):
+                    raise OSError("simulated rename failure")
+                return real_rename(*args, **kwargs)
+
+            script.os.rename = fail_once
+            try:
+                with self.assertRaises(OSError):
+                    script._safe_publish(staging, target)
+            finally:
+                script.os.rename = real_rename
+            # Backup marker must have been restored on failure.
+            self.assertTrue(target.exists())
+            self.assertEqual((target / "marker.txt").read_text(encoding="utf-8"), "previous-success")
+            self.assertFalse(staging.exists())
+
+    def test_safe_publish_replaces_target_on_success(self):
+        script = _load_script_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target = tmp_path / "out"
+            target.mkdir()
+            (target / "old.txt").write_text("old", encoding="utf-8")
+            staging = tmp_path / "staging"
+            staging.mkdir()
+            (staging / "new.txt").write_text("new", encoding="utf-8")
+            script._safe_publish(staging, target)
+            self.assertTrue((target / "new.txt").exists())
+            self.assertFalse((target / "old.txt").exists())
+
+
+class V3CliGateTests(unittest.TestCase):
+    def test_cli_returns_nonzero_when_fingerprint_gate_fails(self):
+        # The SHA-mismatch gate fires before the fingerprint gate; use that as a
+        # cheap offline proxy for "any pre-fit gate fails, no publish".
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_zip = Path(tmp) / "fake.zip"
+            fake_zip.write_bytes(b"not a real archive")
+            out_dir = Path(tmp) / "ev3"
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT_PATH), "validate",
+                 "--config", str(REPO_ROOT / "configs/ds004504_minimal.yaml"),
+                 "--archive", str(fake_zip), "--output-dir", str(out_dir)],
+                capture_output=True, text=True, cwd=str(REPO_ROOT), timeout=180,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(out_dir.exists() and (out_dir / "CODEX_REVIEW_REQUEST.md").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
